@@ -6,9 +6,13 @@ inputs:
         description: "JSON array of packages with their dev versions (e.g., '[{\"name\":\"pylesoft/package\",\"dev\":\"dev-main\"}]')"
         required: true
     version:
-        description: "Version to use: 'dev' for dev versions, or release version like '2025.50.0' for branch versions"
+        description: "Version to use: 'dev' for dev versions, or release version like '2025.50.0'"
         required: false
         default: "dev"
+    update-lock:
+        description: "Whether to run composer update for the changed packages"
+        required: false
+        default: "true"
     commit:
         description: "Whether to commit the changes"
         required: false
@@ -21,6 +25,13 @@ inputs:
 runs:
     using: "composite"
     steps:
+        - name: Setup PHP
+          if: ${{ inputs.update-lock == 'true' }}
+          uses: shivammathur/setup-php@v2
+          with:
+              php-version: '8.3'
+              tools: composer:v2
+
         - name: Bump composer packages
           shell: bash
           run: |
@@ -34,7 +45,6 @@ runs:
                   echo "🔧 Dev mode: Using dev versions"
                   TARGET_MODE="dev"
               elif [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                  # Extract branch version from release version (2025.50.0 -> 2025.50.x)
                   BRANCH_VERSION="${VERSION%.*}.x"
                   echo "🚀 Release mode: Using branch version $BRANCH_VERSION"
                   TARGET_MODE="release"
@@ -43,12 +53,14 @@ runs:
                   TARGET_MODE="dev"
               fi
               
+              # Track updated packages for composer update
+              UPDATED_PACKAGES=""
+              
               # Parse JSON and update each package
               echo "$PACKAGES" | jq -c '.[]' | while read -r package; do
                   PACKAGE_NAME=$(echo "$package" | jq -r '.name')
                   DEV_VERSION=$(echo "$package" | jq -r '.dev // "dev-main"')
                   
-                  # Determine the target version
                   if [[ "$TARGET_MODE" == "dev" ]]; then
                       TARGET_VERSION="$DEV_VERSION"
                   else
@@ -57,29 +69,57 @@ runs:
                   
                   echo "  → Updating $PACKAGE_NAME to $TARGET_VERSION"
                   
-                  # Update composer.json using jq
+                  # Update composer.json
                   jq --arg name "$PACKAGE_NAME" --arg version "$TARGET_VERSION" \
                      '.require[$name] = $version' composer.json > composer.json.tmp
                   mv composer.json.tmp composer.json
+                  
+                  # Add to list for composer update
+                  echo "$PACKAGE_NAME" >> /tmp/updated_packages.txt
               done
               
-              # Validate composer.json format
-              if command -v composer &> /dev/null; then
-                  composer validate --no-check-all --no-check-publish || true
-              fi
+              echo "✅ composer.json updated"
+
+        - name: Update composer.lock
+          if: ${{ inputs.update-lock == 'true' }}
+          shell: bash
+          run: |
+              echo "🔄 Updating composer.lock..."
               
-              echo "✅ Packages bumped successfully"
+              # Read the list of updated packages
+              if [[ -f /tmp/updated_packages.txt ]]; then
+                  PACKAGES_TO_UPDATE=$(cat /tmp/updated_packages.txt | tr '\n' ' ')
+                  
+                  # Configure composer to use GitHub token if available
+                  if [[ -n "${{ github.token }}" ]]; then
+                      composer config --global github-oauth.github.com "${{ github.token }}"
+                  fi
+                  
+                  # Update only the changed packages (faster than full update)
+                  echo "  Running: composer update $PACKAGES_TO_UPDATE --no-install"
+                  composer update $PACKAGES_TO_UPDATE --no-install --no-scripts
+                  
+                  echo "✅ composer.lock updated"
+              else
+                  echo "⚠️ No packages to update"
+              fi
 
         - name: Commit changes
           if: ${{ inputs.commit == 'true' }}
           shell: bash
           run: |
-              if [[ -n $(git status -s composer.json) ]]; then
+              # Check for changes in both files
+              if [[ -n $(git status -s composer.json composer.lock) ]]; then
                   git config user.name "github-actions[bot]"
                   git config user.email "github-actions[bot]@users.noreply.github.com"
-                  git add composer.json
                   
-                  # Enhance commit message with version info
+                  # Add both files
+                  git add composer.json
+                  if [[ -f composer.lock ]]; then
+                      git add composer.lock
+                  fi
+                  
+                  # Enhanced commit message
                   VERSION="${{ inputs.version }}"
                   if [[ -z "$VERSION" ]] || [[ "$VERSION" == "dev" ]] || [[ "$VERSION" == "null" ]]; then
                       COMMIT_MSG="${{ inputs.commit-message }} (dev versions)"
@@ -89,7 +129,7 @@ runs:
                   
                   git commit -m "$COMMIT_MSG"
                   git push
-                  echo "✅ Changes committed"
+                  echo "✅ Changes committed (composer.json + composer.lock)"
               else
                   echo "ℹ️ No changes to commit"
               fi
