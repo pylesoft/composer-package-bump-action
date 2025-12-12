@@ -1,0 +1,95 @@
+name: "Composer Package Bump"
+description: "Bump composer packages based on version (dev or release)"
+
+inputs:
+    packages:
+        description: "JSON array of packages with their dev versions (e.g., '[{\"name\":\"pylesoft/package\",\"dev\":\"dev-main\"}]')"
+        required: true
+    version:
+        description: "Version to use: 'dev' for dev versions, or release version like '2025.50.0' for branch versions"
+        required: false
+        default: "dev"
+    commit:
+        description: "Whether to commit the changes"
+        required: false
+        default: "true"
+    commit-message:
+        description: "Commit message"
+        required: false
+        default: "chore: bump composer packages"
+
+runs:
+    using: "composite"
+    steps:
+        - name: Bump composer packages
+          shell: bash
+          run: |
+              PACKAGES='${{ inputs.packages }}'
+              VERSION="${{ inputs.version }}"
+              
+              echo "📦 Bumping composer packages..."
+              
+              # Determine target version mode
+              if [[ -z "$VERSION" ]] || [[ "$VERSION" == "dev" ]] || [[ "$VERSION" == "null" ]]; then
+                  echo "🔧 Dev mode: Using dev versions"
+                  TARGET_MODE="dev"
+              elif [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                  # Extract branch version from release version (2025.50.0 -> 2025.50.x)
+                  BRANCH_VERSION="${VERSION%.*}.x"
+                  echo "🚀 Release mode: Using branch version $BRANCH_VERSION"
+                  TARGET_MODE="release"
+              else
+                  echo "⚠️ Invalid version format: $VERSION (using dev mode)"
+                  TARGET_MODE="dev"
+              fi
+              
+              # Parse JSON and update each package
+              echo "$PACKAGES" | jq -c '.[]' | while read -r package; do
+                  PACKAGE_NAME=$(echo "$package" | jq -r '.name')
+                  DEV_VERSION=$(echo "$package" | jq -r '.dev // "dev-main"')
+                  
+                  # Determine the target version
+                  if [[ "$TARGET_MODE" == "dev" ]]; then
+                      TARGET_VERSION="$DEV_VERSION"
+                  else
+                      TARGET_VERSION="$BRANCH_VERSION"
+                  fi
+                  
+                  echo "  → Updating $PACKAGE_NAME to $TARGET_VERSION"
+                  
+                  # Update composer.json using jq
+                  jq --arg name "$PACKAGE_NAME" --arg version "$TARGET_VERSION" \
+                     '.require[$name] = $version' composer.json > composer.json.tmp
+                  mv composer.json.tmp composer.json
+              done
+              
+              # Validate composer.json format
+              if command -v composer &> /dev/null; then
+                  composer validate --no-check-all --no-check-publish || true
+              fi
+              
+              echo "✅ Packages bumped successfully"
+
+        - name: Commit changes
+          if: ${{ inputs.commit == 'true' }}
+          shell: bash
+          run: |
+              if [[ -n $(git status -s composer.json) ]]; then
+                  git config user.name "github-actions[bot]"
+                  git config user.email "github-actions[bot]@users.noreply.github.com"
+                  git add composer.json
+                  
+                  # Enhance commit message with version info
+                  VERSION="${{ inputs.version }}"
+                  if [[ -z "$VERSION" ]] || [[ "$VERSION" == "dev" ]] || [[ "$VERSION" == "null" ]]; then
+                      COMMIT_MSG="${{ inputs.commit-message }} (dev versions)"
+                  else
+                      COMMIT_MSG="${{ inputs.commit-message }} (version $VERSION)"
+                  fi
+                  
+                  git commit -m "$COMMIT_MSG"
+                  git push
+                  echo "✅ Changes committed"
+              else
+                  echo "ℹ️ No changes to commit"
+              fi
