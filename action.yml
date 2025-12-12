@@ -9,10 +9,18 @@ inputs:
         description: "Version to use: 'dev' for dev versions, or release version like '2025.50.0'"
         required: false
         default: "dev"
+    php-version:
+        description: "PHP version to use (e.g., '8.1', '8.2', '8.3')"
+        required: false
+        default: "8.3"
     update-lock:
         description: "Whether to run composer update for the changed packages"
         required: false
         default: "true"
+    composer-auth:
+        description: "JSON object with composer authentication config"
+        required: false
+        default: ""
     commit:
         description: "Whether to commit the changes"
         required: false
@@ -29,8 +37,49 @@ runs:
           if: ${{ inputs.update-lock == 'true' }}
           uses: shivammathur/setup-php@v2
           with:
-              php-version: '8.3'
+              php-version: ${{ inputs.php-version }}
               tools: composer:v2
+
+        - name: Configure Composer Authentication
+          if: ${{ inputs.update-lock == 'true' && inputs.composer-auth != '' }}
+          shell: bash
+          run: |
+              echo "🔐 Configuring composer authentication..."
+              
+              # Parse JSON auth config and apply each entry
+              AUTH_CONFIG='${{ inputs.composer-auth }}'
+              
+              # Validate JSON first
+              if ! echo "$AUTH_CONFIG" | jq empty 2>/dev/null; then
+                  echo "❌ Invalid JSON in composer-auth"
+                  exit 1
+              fi
+              
+              echo "$AUTH_CONFIG" | jq -r 'to_entries[] | @base64' | while read -r entry; do
+                  # Decode the entry
+                  _jq() {
+                      echo "$entry" | base64 --decode | jq -r "$1"
+                  }
+                  
+                  DOMAIN=$(_jq '.key')
+                  TYPE=$(_jq '.value.type // "http-basic"')
+                  USERNAME=$(_jq '.value.username // "token"')
+                  PASSWORD=$(_jq '.value.password')
+                  GLOBAL=$(_jq '.value.global // false')
+                  
+                  if [[ "$TYPE" == "http-basic" ]]; then
+                      if [[ "$GLOBAL" == "true" ]]; then
+                          composer config --global --auth "http-basic.$DOMAIN" "$USERNAME" "$PASSWORD"
+                          echo "  ✓ Configured $DOMAIN (global)"
+                      else
+                          composer config "http-basic.$DOMAIN" "$USERNAME" "$PASSWORD"
+                          echo "  ✓ Configured $DOMAIN"
+                      fi
+                  elif [[ "$TYPE" == "github-oauth" ]]; then
+                      composer config --global github-oauth.github.com "$PASSWORD"
+                      echo "  ✓ Configured GitHub OAuth"
+                  fi
+              done
 
         - name: Bump composer packages
           shell: bash
@@ -39,6 +88,15 @@ runs:
               VERSION="${{ inputs.version }}"
               
               echo "📦 Bumping composer packages..."
+              
+              # Validate packages JSON
+              if ! echo "$PACKAGES" | jq empty 2>/dev/null; then
+                  echo "❌ Invalid JSON in packages"
+                  exit 1
+              fi
+              
+              # Clear/create the file
+              > /tmp/updated_packages.txt
               
               # Determine target version mode
               if [[ -z "$VERSION" ]] || [[ "$VERSION" == "dev" ]] || [[ "$VERSION" == "null" ]]; then
@@ -53,13 +111,12 @@ runs:
                   TARGET_MODE="dev"
               fi
               
-              # Track updated packages for composer update
-              UPDATED_PACKAGES=""
-              
-              # Parse JSON and update each package
-              echo "$PACKAGES" | jq -c '.[]' | while read -r package; do
-                  PACKAGE_NAME=$(echo "$package" | jq -r '.name')
-                  DEV_VERSION=$(echo "$package" | jq -r '.dev // "dev-main"')
+              # Process each package (avoiding subshell issue with while loop)
+              PACKAGE_COUNT=$(echo "$PACKAGES" | jq 'length')
+              for i in $(seq 0 $((PACKAGE_COUNT - 1))); do
+                  PACKAGE=$(echo "$PACKAGES" | jq -r ".[$i]")
+                  PACKAGE_NAME=$(echo "$PACKAGE" | jq -r '.name')
+                  DEV_VERSION=$(echo "$PACKAGE" | jq -r '.dev // "dev-main"')
                   
                   if [[ "$TARGET_MODE" == "dev" ]]; then
                       TARGET_VERSION="$DEV_VERSION"
@@ -72,6 +129,13 @@ runs:
                   # Update composer.json
                   jq --arg name "$PACKAGE_NAME" --arg version "$TARGET_VERSION" \
                      '.require[$name] = $version' composer.json > composer.json.tmp
+                  
+                  # Check if jq succeeded
+                  if [[ $? -ne 0 ]]; then
+                      echo "❌ Failed to update composer.json"
+                      exit 1
+                  fi
+                  
                   mv composer.json.tmp composer.json
                   
                   # Add to list for composer update
@@ -86,20 +150,24 @@ runs:
           run: |
               echo "🔄 Updating composer.lock..."
               
-              # Read the list of updated packages
-              if [[ -f /tmp/updated_packages.txt ]]; then
+              # Configure GitHub token if available (for rate limiting)
+              if [[ -n "${{ github.token }}" ]]; then
+                  composer config --global github-oauth.github.com "${{ github.token }}"
+              fi
+              
+              # Check if packages file exists and has content
+              if [[ -f /tmp/updated_packages.txt ]] && [[ -s /tmp/updated_packages.txt ]]; then
                   PACKAGES_TO_UPDATE=$(cat /tmp/updated_packages.txt | tr '\n' ' ')
                   
-                  # Configure composer to use GitHub token if available
-                  if [[ -n "${{ github.token }}" ]]; then
-                      composer config --global github-oauth.github.com "${{ github.token }}"
+                  echo "  Updating packages: $PACKAGES_TO_UPDATE"
+                  
+                  # Run composer update with error handling
+                  if composer update $PACKAGES_TO_UPDATE --no-install --no-scripts; then
+                      echo "✅ composer.lock updated"
+                  else
+                      echo "❌ Failed to update composer.lock"
+                      exit 1
                   fi
-                  
-                  # Update only the changed packages (faster than full update)
-                  echo "  Running: composer update $PACKAGES_TO_UPDATE --no-install"
-                  composer update $PACKAGES_TO_UPDATE --no-install --no-scripts
-                  
-                  echo "✅ composer.lock updated"
               else
                   echo "⚠️ No packages to update"
               fi
@@ -108,18 +176,18 @@ runs:
           if: ${{ inputs.commit == 'true' }}
           shell: bash
           run: |
-              # Check for changes in both files
-              if [[ -n $(git status -s composer.json composer.lock) ]]; then
+              # Check for changes (using || to handle missing files)
+              if git status --porcelain composer.json composer.lock 2>/dev/null | grep -q .; then
                   git config user.name "github-actions[bot]"
                   git config user.email "github-actions[bot]@users.noreply.github.com"
                   
-                  # Add both files
+                  # Add files that exist
                   git add composer.json
                   if [[ -f composer.lock ]]; then
                       git add composer.lock
                   fi
                   
-                  # Enhanced commit message
+                  # Build commit message
                   VERSION="${{ inputs.version }}"
                   if [[ -z "$VERSION" ]] || [[ "$VERSION" == "dev" ]] || [[ "$VERSION" == "null" ]]; then
                       COMMIT_MSG="${{ inputs.commit-message }} (dev versions)"
@@ -129,7 +197,7 @@ runs:
                   
                   git commit -m "$COMMIT_MSG"
                   git push
-                  echo "✅ Changes committed (composer.json + composer.lock)"
+                  echo "✅ Changes committed"
               else
                   echo "ℹ️ No changes to commit"
               fi
