@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - codex/**
+  workflow_dispatch:
+
+jobs:
+  behavioral-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          tools: composer:v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Run behavioral tests
+        shell: bash
+        run: bash tests/assert-update-lock-uses-with-all-dependencies.sh
+
+  composite-action-smoke:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out action repository
+        uses: actions/checkout@v4
+        with:
+          path: action
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          tools: composer:v2
+
+      - name: Create smoke-test fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config --global user.name "Codex"
+          git config --global user.email "codex@example.com"
+
+          mkdir package
+          cd package
+          git init --initial-branch=main
+          cat > composer.json <<'JSON'
+          {
+            "name": "fixture/smoke-package",
+            "type": "library",
+            "require": {
+              "php": ">=8.1"
+            }
+          }
+          JSON
+          git add composer.json
+          git commit -m "Initial package"
+          git tag 1.0.0
+          cd "$GITHUB_WORKSPACE"
+
+          cat > composer.json <<JSON
+          {
+            "name": "fixture/smoke-project",
+            "repositories": [
+              {
+                "type": "vcs",
+                "url": "$GITHUB_WORKSPACE/package"
+              }
+            ],
+            "require": {
+              "fixture/smoke-package": "1.0.0"
+            },
+            "minimum-stability": "dev",
+            "prefer-stable": true
+          }
+          JSON
+
+          composer update --no-install --no-scripts
+
+      - name: Run composite action
+        uses: ./action
+        with:
+          packages: '[{"name":"fixture/smoke-package","dev":"dev-main"}]'
+          version: dev
+          update-lock: true
+          commit: false
+
+      - name: Assert action bumped the package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          php -r '
+          $composer = json_decode(file_get_contents("composer.json"), true, 512, JSON_THROW_ON_ERROR);
+          if (($composer["require"]["fixture/smoke-package"] ?? null) !== "dev-main") {
+              fwrite(STDERR, "composer.json was not bumped to dev-main\n");
+              exit(1);
+          }
+
+          $lock = json_decode(file_get_contents("composer.lock"), true, 512, JSON_THROW_ON_ERROR);
+          foreach (array_merge($lock["packages"] ?? [], $lock["packages-dev"] ?? []) as $package) {
+              if (($package["name"] ?? null) !== "fixture/smoke-package") {
+                  continue;
+              }
+
+              if (($package["version"] ?? null) !== "dev-main") {
+                  fwrite(STDERR, "composer.lock was not bumped to dev-main\n");
+                  exit(1);
+              }
+
+              exit(0);
+          }
+
+          fwrite(STDERR, "fixture/smoke-package was not found in composer.lock\n");
+          exit(1);
+          '
