@@ -162,7 +162,7 @@ runs:
                   echo "  Updating packages: $PACKAGES_TO_UPDATE"
                   
                   # Run composer update with error handling
-                  if composer update $PACKAGES_TO_UPDATE --no-install --no-scripts; then
+                  if composer update $PACKAGES_TO_UPDATE --with-all-dependencies --no-install --no-scripts; then
                       echo "✅ composer.lock updated"
                   else
                       echo "❌ Failed to update composer.lock"
