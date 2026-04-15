@@ -169,9 +169,13 @@ runs:
                       echo "✅ composer.lock updated"
                   else
                       echo "  Scoped update failed, retrying with a full composer.lock rebuild"
+                      if [[ -f composer.lock ]]; then
+                          cp composer.lock /tmp/composer.lock.before-full-rebuild
+                      fi
                       
                       if composer update --with-all-dependencies --no-install --no-scripts; then
                           echo "✅ composer.lock updated after full rebuild"
+                          php "${{ github.action_path }}/scripts/report_full_rebuild_churn.php" /tmp/composer.lock.before-full-rebuild composer.lock /tmp/updated_packages.txt
                       else
                           echo "❌ Failed to update composer.lock"
                           exit 1
@@ -186,48 +190,7 @@ runs:
           shell: bash
           run: |
               echo "🔎 Validating bumped package versions in composer.lock..."
-              
-              version_matches_target() {
-                  local locked_version="$1"
-                  local target_version="$2"
-                  
-                  if [[ "$target_version" == dev-* ]]; then
-                      [[ "$locked_version" == "$target_version" ]]
-                      return
-                  fi
-                  
-                  if [[ "$target_version" =~ ^[0-9]+\.[0-9]+\.x$ ]]; then
-                      local release_prefix="${target_version%.x}."
-                      
-                      [[ "$locked_version" == "$target_version" ]] \
-                          || [[ "$locked_version" == "${target_version}-dev" ]] \
-                          || [[ "$locked_version" == "dev-$target_version" ]] \
-                          || [[ "$locked_version" == "$release_prefix"* ]]
-                      return
-                  fi
-                  
-                  [[ "$locked_version" == "$target_version" ]]
-              }
-              
-              if [[ -f /tmp/updated_package_targets.txt ]] && [[ -s /tmp/updated_package_targets.txt ]]; then
-                  while IFS=$'\t' read -r PACKAGE_NAME TARGET_VERSION; do
-                      LOCKED_VERSION=$(composer show --locked --format=json "$PACKAGE_NAME" 2>/dev/null | jq -r '.versions[0] // empty')
-                      
-                      if [[ -z "$LOCKED_VERSION" ]]; then
-                          echo "❌ Could not determine locked version for $PACKAGE_NAME"
-                          exit 1
-                      fi
-                      
-                      if version_matches_target "$LOCKED_VERSION" "$TARGET_VERSION"; then
-                          echo "  ✓ $PACKAGE_NAME locked to $LOCKED_VERSION (target: $TARGET_VERSION)"
-                      else
-                          echo "❌ $PACKAGE_NAME locked to $LOCKED_VERSION but expected $TARGET_VERSION"
-                          exit 1
-                      fi
-                  done < /tmp/updated_package_targets.txt
-              else
-                  echo "⚠️ No bumped packages to validate"
-              fi
+              php "${{ github.action_path }}/scripts/validate_locked_targets.php" /tmp/updated_package_targets.txt composer.lock
 
         - name: Commit changes
           if: ${{ inputs.commit == 'true' }}
