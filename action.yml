@@ -97,6 +97,7 @@ runs:
               
               # Clear/create the file
               > /tmp/updated_packages.txt
+              > /tmp/updated_package_targets.txt
               
               # Determine target version mode
               if [[ -z "$VERSION" ]] || [[ "$VERSION" == "dev" ]] || [[ "$VERSION" == "null" ]]; then
@@ -140,6 +141,7 @@ runs:
                   
                   # Add to list for composer update
                   echo "$PACKAGE_NAME" >> /tmp/updated_packages.txt
+                  printf '%s\t%s\n' "$PACKAGE_NAME" "$TARGET_VERSION" >> /tmp/updated_package_targets.txt
               done
               
               echo "✅ composer.json updated"
@@ -177,6 +179,54 @@ runs:
                   fi
               else
                   echo "⚠️ No packages to update"
+              fi
+
+        - name: Validate bumped packages in composer.lock
+          if: ${{ inputs.update-lock == 'true' }}
+          shell: bash
+          run: |
+              echo "🔎 Validating bumped package versions in composer.lock..."
+              
+              version_matches_target() {
+                  local locked_version="$1"
+                  local target_version="$2"
+                  
+                  if [[ "$target_version" == dev-* ]]; then
+                      [[ "$locked_version" == "$target_version" ]]
+                      return
+                  fi
+                  
+                  if [[ "$target_version" =~ ^[0-9]+\.[0-9]+\.x$ ]]; then
+                      local release_prefix="${target_version%.x}."
+                      
+                      [[ "$locked_version" == "$target_version" ]] \
+                          || [[ "$locked_version" == "${target_version}-dev" ]] \
+                          || [[ "$locked_version" == "dev-$target_version" ]] \
+                          || [[ "$locked_version" == "$release_prefix"* ]]
+                      return
+                  fi
+                  
+                  [[ "$locked_version" == "$target_version" ]]
+              }
+              
+              if [[ -f /tmp/updated_package_targets.txt ]] && [[ -s /tmp/updated_package_targets.txt ]]; then
+                  while IFS=$'\t' read -r PACKAGE_NAME TARGET_VERSION; do
+                      LOCKED_VERSION=$(composer show --locked --format=json "$PACKAGE_NAME" 2>/dev/null | jq -r '.versions[0] // empty')
+                      
+                      if [[ -z "$LOCKED_VERSION" ]]; then
+                          echo "❌ Could not determine locked version for $PACKAGE_NAME"
+                          exit 1
+                      fi
+                      
+                      if version_matches_target "$LOCKED_VERSION" "$TARGET_VERSION"; then
+                          echo "  ✓ $PACKAGE_NAME locked to $LOCKED_VERSION (target: $TARGET_VERSION)"
+                      else
+                          echo "❌ $PACKAGE_NAME locked to $LOCKED_VERSION but expected $TARGET_VERSION"
+                          exit 1
+                      fi
+                  done < /tmp/updated_package_targets.txt
+              else
+                  echo "⚠️ No bumped packages to validate"
               fi
 
         - name: Commit changes
