@@ -157,9 +157,7 @@ runs:
               
               # Check if packages file exists and has content
               if [[ -f /tmp/updated_packages.txt ]] && [[ -s /tmp/updated_packages.txt ]]; then
-                  PACKAGES_TO_UPDATE=$(cat /tmp/updated_packages.txt | tr '\n' ' ')
-                  
-                  echo "  Bumped packages: $PACKAGES_TO_UPDATE"
+                  echo "  Bumped packages: $(tr '\n' ' ' < /tmp/updated_packages.txt)"
                   echo "  Rebuilding full composer.lock to avoid partial update conflicts"
                   
                   # Run composer update with error handling
