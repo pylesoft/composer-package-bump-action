@@ -2,202 +2,447 @@ name: "Composer Package Bump"
 description: "Bump composer packages based on version (dev or release)"
 
 inputs:
-    packages:
-        description: "JSON array of packages with their dev versions (e.g., '[{\"name\":\"pylesoft/package\",\"dev\":\"dev-main\"}]')"
-        required: true
-    version:
-        description: "Version to use: 'dev' for dev versions, or release version like '2025.50.0'"
-        required: false
-        default: "dev"
-    php-version:
-        description: "PHP version to use (e.g., '8.1', '8.2', '8.3')"
-        required: false
-        default: "8.3"
-    update-lock:
-        description: "Whether to run composer update for the changed packages"
-        required: false
-        default: "true"
-    composer-auth:
-        description: "JSON object with composer authentication config"
-        required: false
-        default: ""
-    commit:
-        description: "Whether to commit the changes"
-        required: false
-        default: "true"
-    commit-message:
-        description: "Commit message"
-        required: false
-        default: "chore: bump composer packages"
+  packages:
+    description: "JSON array of packages with their dev versions (e.g., '[{\"name\":\"pylesoft/package\",\"dev\":\"dev-main\"}]')"
+    required: true
+  version:
+    description: "Version to use: 'dev' for dev versions, or release version like '2025.50.0'"
+    required: false
+    default: "dev"
+  php-version:
+    description: "PHP version to use (e.g., '8.1', '8.2', '8.3')"
+    required: false
+    default: "8.3"
+  update-lock:
+    description: "Whether to run composer update for the changed packages"
+    required: false
+    default: "true"
+  composer-auth:
+    description: "JSON object with composer authentication config"
+    required: false
+    default: ""
+  commit:
+    description: "Whether to commit the changes"
+    required: false
+    default: "true"
+  commit-message:
+    description: "Commit message"
+    required: false
+    default: "chore: bump composer packages"
 
 runs:
-    using: "composite"
-    steps:
-        - name: Setup PHP
-          if: ${{ inputs.update-lock == 'true' }}
-          uses: shivammathur/setup-php@v2
-          with:
-              php-version: ${{ inputs.php-version }}
-              tools: composer:v2
+  using: "composite"
+  steps:
+    - name: Setup PHP
+      if: ${{ inputs.update-lock == 'true' }}
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: ${{ inputs.php-version }}
+        tools: composer:v2
 
-        - name: Configure Composer Authentication
-          if: ${{ inputs.update-lock == 'true' && inputs.composer-auth != '' }}
-          shell: bash
-          run: |
-              echo "🔐 Configuring composer authentication..."
-              
-              # Parse JSON auth config and apply each entry
-              AUTH_CONFIG='${{ inputs.composer-auth }}'
-              
-              # Validate JSON first
-              if ! echo "$AUTH_CONFIG" | jq empty 2>/dev/null; then
-                  echo "❌ Invalid JSON in composer-auth"
-                  exit 1
-              fi
-              
-              echo "$AUTH_CONFIG" | jq -r 'to_entries[] | @base64' | while read -r entry; do
-                  # Decode the entry
-                  _jq() {
-                      echo "$entry" | base64 --decode | jq -r "$1"
-                  }
-                  
-                  DOMAIN=$(_jq '.key')
-                  TYPE=$(_jq '.value.type // "http-basic"')
-                  USERNAME=$(_jq '.value.username // "token"')
-                  PASSWORD=$(_jq '.value.password')
-                  GLOBAL=$(_jq '.value.global // false')
-                  
-                  if [[ "$TYPE" == "http-basic" ]]; then
-                      if [[ "$GLOBAL" == "true" ]]; then
-                          composer config --global --auth "http-basic.$DOMAIN" "$USERNAME" "$PASSWORD"
-                          echo "  ✓ Configured $DOMAIN (global)"
-                      else
-                          composer config "http-basic.$DOMAIN" "$USERNAME" "$PASSWORD"
-                          echo "  ✓ Configured $DOMAIN"
-                      fi
-                  elif [[ "$TYPE" == "github-oauth" ]]; then
-                      composer config --global github-oauth.github.com "$PASSWORD"
-                      echo "  ✓ Configured GitHub OAuth"
-                  fi
-              done
+    - name: Configure Composer Authentication
+      if: ${{ inputs.update-lock == 'true' && inputs.composer-auth != '' }}
+      shell: bash
+      run: |
+        echo "Configuring composer authentication..."
 
-        - name: Bump composer packages
-          shell: bash
-          run: |
-              PACKAGES='${{ inputs.packages }}'
-              VERSION="${{ inputs.version }}"
-              
-              echo "📦 Bumping composer packages..."
-              
-              # Validate packages JSON
-              if ! echo "$PACKAGES" | jq empty 2>/dev/null; then
-                  echo "❌ Invalid JSON in packages"
-                  exit 1
-              fi
-              
-              # Clear/create the file
-              > /tmp/updated_packages.txt
-              
-              # Determine target version mode
-              if [[ -z "$VERSION" ]] || [[ "$VERSION" == "dev" ]] || [[ "$VERSION" == "null" ]]; then
-                  echo "🔧 Dev mode: Using dev versions"
-                  TARGET_MODE="dev"
-              elif [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                  BRANCH_VERSION="${VERSION%.*}.x"
-                  echo "🚀 Release mode: Using branch version $BRANCH_VERSION"
-                  TARGET_MODE="release"
-              else
-                  echo "⚠️ Invalid version format: $VERSION (using dev mode)"
-                  TARGET_MODE="dev"
-              fi
-              
-              # Process each package (avoiding subshell issue with while loop)
-              PACKAGE_COUNT=$(echo "$PACKAGES" | jq 'length')
-              for i in $(seq 0 $((PACKAGE_COUNT - 1))); do
-                  PACKAGE=$(echo "$PACKAGES" | jq -r ".[$i]")
-                  PACKAGE_NAME=$(echo "$PACKAGE" | jq -r '.name')
-                  DEV_VERSION=$(echo "$PACKAGE" | jq -r '.dev // "dev-main"')
-                  
-                  if [[ "$TARGET_MODE" == "dev" ]]; then
-                      TARGET_VERSION="$DEV_VERSION"
-                  else
-                      TARGET_VERSION="$BRANCH_VERSION"
-                  fi
-                  
-                  echo "  → Updating $PACKAGE_NAME to $TARGET_VERSION"
-                  
-                  # Update composer.json
-                  jq --arg name "$PACKAGE_NAME" --arg version "$TARGET_VERSION" \
-                     '.require[$name] = $version' composer.json > composer.json.tmp
-                  
-                  # Check if jq succeeded
-                  if [[ $? -ne 0 ]]; then
-                      echo "❌ Failed to update composer.json"
-                      exit 1
-                  fi
-                  
-                  mv composer.json.tmp composer.json
-                  
-                  # Add to list for composer update
-                  echo "$PACKAGE_NAME" >> /tmp/updated_packages.txt
-              done
-              
-              echo "✅ composer.json updated"
+        AUTH_CONFIG='${{ inputs.composer-auth }}'
 
-        - name: Update composer.lock
-          if: ${{ inputs.update-lock == 'true' }}
-          shell: bash
-          run: |
-              echo "🔄 Updating composer.lock..."
-              
-              # Configure GitHub token if available (for rate limiting)
-              if [[ -n "${{ github.token }}" ]]; then
-                  composer config --global github-oauth.github.com "${{ github.token }}"
-              fi
-              
-              # Check if packages file exists and has content
-              if [[ -f /tmp/updated_packages.txt ]] && [[ -s /tmp/updated_packages.txt ]]; then
-                  PACKAGES_TO_UPDATE=$(cat /tmp/updated_packages.txt | tr '\n' ' ')
-                  
-                  echo "  Updating packages: $PACKAGES_TO_UPDATE"
-                  
-                  # Run composer update with error handling
-                  if composer update $PACKAGES_TO_UPDATE --no-install --no-scripts; then
-                      echo "✅ composer.lock updated"
-                  else
-                      echo "❌ Failed to update composer.lock"
-                      exit 1
-                  fi
-              else
-                  echo "⚠️ No packages to update"
-              fi
+        if ! echo "$AUTH_CONFIG" | jq empty 2>/dev/null; then
+            echo "Invalid JSON in composer-auth"
+            exit 1
+        fi
 
-        - name: Commit changes
-          if: ${{ inputs.commit == 'true' }}
-          shell: bash
-          run: |
-              # Check for changes (using || to handle missing files)
-              if git status --porcelain composer.json composer.lock 2>/dev/null | grep -q .; then
-                  git config user.name "github-actions[bot]"
-                  git config user.email "github-actions[bot]@users.noreply.github.com"
-                  
-                  # Add files that exist
-                  git add composer.json
-                  if [[ -f composer.lock ]]; then
-                      git add composer.lock
-                  fi
-                  
-                  # Build commit message
-                  VERSION="${{ inputs.version }}"
-                  if [[ -z "$VERSION" ]] || [[ "$VERSION" == "dev" ]] || [[ "$VERSION" == "null" ]]; then
-                      COMMIT_MSG="${{ inputs.commit-message }} (dev versions)"
-                  else
-                      COMMIT_MSG="${{ inputs.commit-message }} (version $VERSION)"
-                  fi
-                  
-                  git commit -m "$COMMIT_MSG"
-                  git push
-                  echo "✅ Changes committed"
-              else
-                  echo "ℹ️ No changes to commit"
-              fi
+        echo "$AUTH_CONFIG" | jq -r 'to_entries[] | @base64' | while read -r entry; do
+            decode_entry() {
+                echo "$entry" | base64 --decode | jq -r "$1"
+            }
+
+            domain=$(decode_entry '.key')
+            type=$(decode_entry '.value.type // "http-basic"')
+            username=$(decode_entry '.value.username // "token"')
+            password=$(decode_entry '.value.password')
+            is_global=$(decode_entry '.value.global // false')
+
+            if [[ "$type" == "http-basic" ]]; then
+                if [[ "$is_global" == "true" ]]; then
+                    composer config --global --auth "http-basic.$domain" "$username" "$password"
+                    echo "  Configured $domain (global)"
+                else
+                    composer config "http-basic.$domain" "$username" "$password"
+                    echo "  Configured $domain"
+                fi
+            elif [[ "$type" == "github-oauth" ]]; then
+                composer config --global github-oauth.github.com "$password"
+                echo "  Configured GitHub OAuth"
+            fi
+        done
+
+    - name: Bump composer packages
+      shell: bash
+      run: |
+        PACKAGES='${{ inputs.packages }}'
+        VERSION="${{ inputs.version }}"
+
+        echo "Bumping composer packages..."
+
+        if ! echo "$PACKAGES" | jq empty 2>/dev/null; then
+            echo "Invalid JSON in packages"
+            exit 1
+        fi
+
+        > /tmp/updated_packages.txt
+        > /tmp/updated_package_targets.txt
+
+        if [[ -z "$VERSION" ]] || [[ "$VERSION" == "dev" ]] || [[ "$VERSION" == "null" ]]; then
+            echo "Dev mode: using dev versions"
+            TARGET_MODE="dev"
+        elif [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            BRANCH_VERSION="${VERSION%.*}.x"
+            echo "Release mode: using branch version $BRANCH_VERSION"
+            TARGET_MODE="release"
+        else
+            echo "Invalid version format: $VERSION (using dev mode)"
+            TARGET_MODE="dev"
+        fi
+
+        PACKAGE_COUNT=$(echo "$PACKAGES" | jq 'length')
+
+        for i in $(seq 0 $((PACKAGE_COUNT - 1))); do
+            package=$(echo "$PACKAGES" | jq -r ".[$i]")
+            package_name=$(echo "$package" | jq -r '.name')
+            dev_version=$(echo "$package" | jq -r '.dev // "dev-main"')
+
+            if [[ "$TARGET_MODE" == "dev" ]]; then
+                target_version="$dev_version"
+            else
+                target_version="$BRANCH_VERSION"
+            fi
+
+            echo "  Updating $package_name to $target_version"
+
+            jq --arg name "$package_name" --arg version "$target_version" \
+                '.require[$name] = $version' composer.json > composer.json.tmp
+
+            if [[ $? -ne 0 ]]; then
+                echo "Failed to update composer.json"
+                exit 1
+            fi
+
+            mv composer.json.tmp composer.json
+
+            echo "$package_name" >> /tmp/updated_packages.txt
+            printf '%s\t%s\n' "$package_name" "$target_version" >> /tmp/updated_package_targets.txt
+        done
+
+        echo "composer.json updated"
+
+    - name: Update composer.lock
+      if: ${{ inputs.update-lock == 'true' }}
+      shell: bash
+      run: |
+        HELPER_DIR="${RUNNER_TEMP:-/tmp}"
+        VALIDATE_LOCKED_TARGETS_SCRIPT="$HELPER_DIR/validate_locked_targets.php"
+        REPORT_FULL_REBUILD_CHURN_SCRIPT="$HELPER_DIR/report_full_rebuild_churn.php"
+
+        # BEGIN validate_locked_targets.php
+        cat > "$VALIDATE_LOCKED_TARGETS_SCRIPT" <<'PHP'
+        <?php
+
+        declare(strict_types=1);
+
+        if ($argc < 3) {
+            fwrite(STDERR, "Usage: php validate_locked_targets.php <targets-file> <lock-file>\n");
+            exit(1);
+        }
+
+        $targetsFile = $argv[1];
+        $lockFile = $argv[2];
+
+        if (! is_file($targetsFile) || filesize($targetsFile) === 0) {
+            fwrite(STDOUT, "No bumped packages to validate\n");
+            exit(0);
+        }
+
+        if (! is_file($lockFile)) {
+            fwrite(STDERR, "Missing composer.lock file\n");
+            exit(1);
+        }
+
+        $lockPayload = json_decode(file_get_contents($lockFile), true, 512, JSON_THROW_ON_ERROR);
+        $lockedPackages = [];
+
+        foreach (array_merge($lockPayload['packages'] ?? [], $lockPayload['packages-dev'] ?? []) as $package) {
+            if (isset($package['name'], $package['version']) && is_string($package['name']) && is_string($package['version'])) {
+                $lockedPackages[$package['name']] = $package;
+            }
+        }
+
+        $targets = file($targetsFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+
+        if ($targets === false) {
+            fwrite(STDERR, "Could not read bumped package targets\n");
+            exit(1);
+        }
+
+        foreach ($targets as $targetLine) {
+            [$packageName, $targetVersion] = array_pad(explode("\t", $targetLine, 2), 2, '');
+
+            if ($packageName === '' || $targetVersion === '') {
+                fwrite(STDERR, "Invalid bumped package target entry: {$targetLine}\n");
+                exit(1);
+            }
+
+            $lockedPackage = $lockedPackages[$packageName] ?? null;
+
+            if ($lockedPackage === null) {
+                fwrite(STDERR, "Could not determine locked version for {$packageName}\n");
+                exit(1);
+            }
+
+            $lockedVersion = $lockedPackage['version'];
+
+            if (! versionMatchesTarget($lockedPackage, $targetVersion)) {
+                fwrite(STDERR, "{$packageName} locked to {$lockedVersion} but expected {$targetVersion}\n");
+                exit(1);
+            }
+
+            fwrite(STDOUT, "  $packageName locked to $lockedVersion (target: $targetVersion)\n");
+        }
+
+        function versionMatchesTarget(array $lockedPackage, string $targetVersion): bool
+        {
+            $lockedVersion = $lockedPackage['version'] ?? '';
+            $branchAliases = $lockedPackage['extra']['branch-alias'] ?? [];
+
+            if (! is_array($branchAliases)) {
+                $branchAliases = [];
+            }
+
+            if (str_starts_with($targetVersion, 'dev-')) {
+                return $lockedVersion === $targetVersion;
+            }
+
+            if (str_ends_with($targetVersion, '-dev')) {
+                if ($lockedVersion === $targetVersion) {
+                    return true;
+                }
+
+                return ($branchAliases[$lockedVersion] ?? null) === $targetVersion;
+            }
+
+            if (preg_match('/^\d+\.\d+\.x$/', $targetVersion) === 1) {
+                $releasePrefix = substr($targetVersion, 0, -1);
+                $releaseAlias = "{$targetVersion}-dev";
+
+                return $lockedVersion === $targetVersion
+                    || $lockedVersion === $releaseAlias
+                    || $lockedVersion === "dev-{$targetVersion}"
+                    || ($branchAliases[$lockedVersion] ?? null) === $releaseAlias
+                    || str_starts_with($lockedVersion, $releasePrefix);
+            }
+
+            return $lockedVersion === $targetVersion;
+        }
+        PHP
+        # END validate_locked_targets.php
+
+        # BEGIN report_full_rebuild_churn.php
+        cat > "$REPORT_FULL_REBUILD_CHURN_SCRIPT" <<'PHP'
+        <?php
+
+        declare(strict_types=1);
+
+        if ($argc < 4) {
+            fwrite(STDERR, "Usage: php report_full_rebuild_churn.php <before-lock> <after-lock> <bumped-packages-file>\n");
+            exit(1);
+        }
+
+        $beforeLockFile = $argv[1];
+        $afterLockFile = $argv[2];
+        $bumpedPackagesFile = $argv[3];
+
+        if (! is_file($beforeLockFile) || ! is_file($afterLockFile)) {
+            fwrite(STDOUT, "  No lock snapshot available to compare broader churn\n");
+            exit(0);
+        }
+
+        $beforePackages = loadPackageFingerprints($beforeLockFile);
+        $afterPackages = loadPackageFingerprints($afterLockFile);
+        $bumpedPackages = loadBumpedPackages($bumpedPackagesFile);
+        $packageNames = array_unique(array_merge(array_keys($beforePackages), array_keys($afterPackages)));
+        sort($packageNames);
+
+        $changes = [];
+
+        foreach ($packageNames as $packageName) {
+            if (isset($bumpedPackages[$packageName])) {
+                continue;
+            }
+
+            $beforeFingerprint = $beforePackages[$packageName] ?? null;
+            $afterFingerprint = $afterPackages[$packageName] ?? null;
+
+            if ($beforeFingerprint === $afterFingerprint) {
+                continue;
+            }
+
+            $changes[] = [
+                'name' => $packageName,
+                'before' => $beforeFingerprint,
+                'after' => $afterFingerprint,
+            ];
+        }
+
+        if ($changes === []) {
+            fwrite(STDOUT, "  No additional lock changes outside bumped packages during full rebuild\n");
+            exit(0);
+        }
+
+        fwrite(STDOUT, "  Additional lock changes from full rebuild:\n");
+
+        foreach ($changes as $change) {
+            $beforeDescription = describeFingerprint($change['before'] ?? null);
+            $afterDescription = describeFingerprint($change['after'] ?? null);
+            fwrite(STDOUT, "    - {$change['name']}: {$beforeDescription} -> {$afterDescription}\n");
+        }
+
+        function loadPackageFingerprints(string $lockFile): array
+        {
+            $lockPayload = json_decode(file_get_contents($lockFile), true, 512, JSON_THROW_ON_ERROR);
+            $packages = [];
+
+            foreach (array_merge($lockPayload['packages'] ?? [], $lockPayload['packages-dev'] ?? []) as $package) {
+                if (isset($package['name'], $package['version']) && is_string($package['name']) && is_string($package['version'])) {
+                    $packages[$package['name']] = [
+                        'version' => $package['version'],
+                        'source_reference' => extractReference($package['source'] ?? null),
+                        'dist_reference' => extractReference($package['dist'] ?? null),
+                    ];
+                }
+            }
+
+            return $packages;
+        }
+
+        function extractReference(mixed $value): ?string
+        {
+            if (! is_array($value)) {
+                return null;
+            }
+
+            $reference = $value['reference'] ?? null;
+
+            return is_string($reference) ? $reference : null;
+        }
+
+        function describeFingerprint(?array $fingerprint): string
+        {
+            if ($fingerprint === null) {
+                return '(not locked)';
+            }
+
+            $version = $fingerprint['version'] ?? '(unknown version)';
+            $references = [];
+
+            if (isset($fingerprint['source_reference']) && is_string($fingerprint['source_reference'])) {
+                $references[] = "source: {$fingerprint['source_reference']}";
+            }
+
+            if (isset($fingerprint['dist_reference']) && is_string($fingerprint['dist_reference'])) {
+                $references[] = "dist: {$fingerprint['dist_reference']}";
+            }
+
+            if ($references === []) {
+                return $version;
+            }
+
+            return sprintf('%s [%s]', $version, implode(', ', $references));
+        }
+
+        function loadBumpedPackages(string $packagesFile): array
+        {
+            if (! is_file($packagesFile) || filesize($packagesFile) === 0) {
+                return [];
+            }
+
+            $packages = [];
+            $lines = file($packagesFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+
+            if ($lines === false) {
+                return [];
+            }
+
+            foreach ($lines as $line) {
+                $packages[$line] = true;
+            }
+
+            return $packages;
+        }
+        PHP
+        # END report_full_rebuild_churn.php
+
+        echo "Updating composer.lock..."
+
+        if [[ -n "${{ github.token }}" ]]; then
+            composer config --global github-oauth.github.com "${{ github.token }}"
+        fi
+
+        if [[ -f /tmp/updated_packages.txt ]] && [[ -s /tmp/updated_packages.txt ]]; then
+            PACKAGES_TO_UPDATE=$(tr '\n' ' ' < /tmp/updated_packages.txt)
+
+            echo "  Bumped packages: $PACKAGES_TO_UPDATE"
+            echo "  Trying a scoped composer.lock update first"
+
+            if composer update $PACKAGES_TO_UPDATE --with-all-dependencies --no-install --no-scripts; then
+                echo "composer.lock updated"
+            else
+                echo "  Scoped update failed, retrying with a full composer.lock rebuild"
+
+                if [[ -f composer.lock ]]; then
+                    cp composer.lock /tmp/composer.lock.before-full-rebuild
+                fi
+
+                if composer update --with-all-dependencies --no-install --no-scripts; then
+                    echo "composer.lock updated after full rebuild"
+                    php "$REPORT_FULL_REBUILD_CHURN_SCRIPT" /tmp/composer.lock.before-full-rebuild composer.lock /tmp/updated_packages.txt
+                else
+                    echo "Failed to update composer.lock"
+                    exit 1
+                fi
+            fi
+        else
+            echo "No packages to update"
+        fi
+
+        echo "Validating bumped package versions in composer.lock..."
+        php "$VALIDATE_LOCKED_TARGETS_SCRIPT" /tmp/updated_package_targets.txt composer.lock
+
+    - name: Commit changes
+      if: ${{ inputs.commit == 'true' }}
+      shell: bash
+      run: |
+        if git status --porcelain composer.json composer.lock 2>/dev/null | grep -q .; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+
+            git add composer.json
+
+            if [[ -f composer.lock ]]; then
+                git add composer.lock
+            fi
+
+            VERSION="${{ inputs.version }}"
+
+            if [[ -z "$VERSION" ]] || [[ "$VERSION" == "dev" ]] || [[ "$VERSION" == "null" ]]; then
+                COMMIT_MSG="${{ inputs.commit-message }} (dev versions)"
+            else
+                COMMIT_MSG="${{ inputs.commit-message }} (version $VERSION)"
+            fi
+
+            git commit -m "$COMMIT_MSG"
+            git push
+            echo "Changes committed"
+        else
+            echo "No changes to commit"
+        fi
