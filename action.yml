@@ -159,10 +159,11 @@ runs:
               if [[ -f /tmp/updated_packages.txt ]] && [[ -s /tmp/updated_packages.txt ]]; then
                   PACKAGES_TO_UPDATE=$(cat /tmp/updated_packages.txt | tr '\n' ' ')
                   
-                  echo "  Updating packages: $PACKAGES_TO_UPDATE"
+                  echo "  Bumped packages: $PACKAGES_TO_UPDATE"
+                  echo "  Rebuilding full composer.lock to avoid partial update conflicts"
                   
                   # Run composer update with error handling
-                  if composer update $PACKAGES_TO_UPDATE --with-all-dependencies --no-install --no-scripts; then
+                  if composer update --with-all-dependencies --no-install --no-scripts; then
                       echo "✅ composer.lock updated"
                   else
                       echo "❌ Failed to update composer.lock"
