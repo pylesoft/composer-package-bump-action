@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import tempfile
+import textwrap
 from contextlib import contextmanager
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ACTION_FILE = REPO_ROOT / "action.yml"
+ACTION_TEXT = ACTION_FILE.read_text(encoding="utf-8")
 
 
 def find_composer_command() -> list[str]:
@@ -105,6 +108,30 @@ def write_json(path: Path, payload: dict) -> None:
     path.write_text(f"{json.dumps(payload, indent=2)}\n", encoding="utf-8")
 
 
+def extract_embedded_php_script(script_name: str) -> str:
+    start_marker = f"# BEGIN {script_name}"
+    end_marker = f"# END {script_name}"
+
+    if start_marker not in ACTION_TEXT or end_marker not in ACTION_TEXT:
+        raise AssertionError(f"Missing embedded helper markers for {script_name}")
+
+    section = ACTION_TEXT.split(start_marker, 1)[1].split(end_marker, 1)[0]
+    match = re.search(r"<<'PHP'\n(.*?)\n\s*PHP", section, re.DOTALL)
+
+    if match is None:
+        raise AssertionError(f"Could not extract embedded helper for {script_name}")
+
+    return f"{textwrap.dedent(match.group(1)).lstrip()}\n"
+
+
+@contextmanager
+def embedded_php_script(script_name: str):
+    with temporary_directory(prefix=f"{script_name.replace('.', '-')}-") as temp_dir:
+        script_path = Path(temp_dir) / script_name
+        script_path.write_text(extract_embedded_php_script(script_name), encoding="utf-8")
+        yield composer_repo_url(script_path)
+
+
 def init_git_repo(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     run(["git", "init", "--initial-branch=main"], cwd=path)
@@ -148,21 +175,23 @@ def load_locked_version(lock_path: Path, package_name: str) -> str:
 
 
 def assert_action_structure() -> None:
-    action = ACTION_FILE.read_text(encoding="utf-8")
-
     required_fragments = [
-        "composer update $PACKAGES_TO_UPDATE --with-all-dependencies --no-install --no-scripts",
-        "composer update --with-all-dependencies --no-install --no-scripts",
-        "${{ github.action_path }}/scripts/validate_locked_targets.php",
-        "${{ github.action_path }}/scripts/report_full_rebuild_churn.php",
-        "/tmp/composer.lock.before-full-rebuild",
+        '# BEGIN validate_locked_targets.php',
+        '# END validate_locked_targets.php',
+        '# BEGIN report_full_rebuild_churn.php',
+        '# END report_full_rebuild_churn.php',
+        'php "$VALIDATE_LOCKED_TARGETS_SCRIPT" /tmp/updated_package_targets.txt composer.lock',
+        'php "$REPORT_FULL_REBUILD_CHURN_SCRIPT" /tmp/composer.lock.before-full-rebuild composer.lock /tmp/updated_packages.txt',
     ]
 
     for fragment in required_fragments:
-        if fragment not in action:
+        if fragment not in ACTION_TEXT:
             raise AssertionError(f"Missing expected action fragment: {fragment}")
 
-    if 'composer show --locked --format=json "$PACKAGE_NAME"' in action:
+    if "${{ github.action_path }}/scripts/" in ACTION_TEXT:
+        raise AssertionError("Action should no longer depend on repository helper scripts")
+
+    if 'composer show --locked --format=json "$PACKAGE_NAME"' in ACTION_TEXT:
         raise AssertionError("Validator still relies on composer show --locked for locked versions")
 
 
@@ -171,6 +200,7 @@ def alias_fixture() -> None:
         root = Path(temp_dir)
         package_repo = root / "aliased-package"
         project = root / "project"
+        validate_targets_path: str
 
         make_package_repo(
             package_repo,
@@ -215,57 +245,34 @@ def alias_fixture() -> None:
         if locked_version != "dev-main":
             raise AssertionError(f"Expected composer.lock to store dev-main, got {locked_version}")
 
-        run(
-            [
-                *PHP,
-                composer_repo_url(REPO_ROOT / "scripts" / "validate_locked_targets.php"),
-                composer_repo_url(targets_file),
-                "composer.lock",
-            ],
-            cwd=project,
-        )
+        with embedded_php_script("validate_locked_targets.php") as validate_targets_path:
+            run([*PHP, validate_targets_path, composer_repo_url(targets_file), "composer.lock"], cwd=project)
 
-        root_payload = json.loads((project / "composer.json").read_text(encoding="utf-8"))
-        root_payload["require"]["fixture/aliased-package"] = "1.0.x-dev"
-        write_json(project / "composer.json", root_payload)
-        run([*COMPOSER, "update", "--no-install", "--no-scripts"], cwd=project)
+            root_payload = json.loads((project / "composer.json").read_text(encoding="utf-8"))
+            root_payload["require"]["fixture/aliased-package"] = "1.0.x-dev"
+            write_json(project / "composer.json", root_payload)
+            run([*COMPOSER, "update", "--no-install", "--no-scripts"], cwd=project)
 
-        alias_locked_version = load_locked_version(project / "composer.lock", "fixture/aliased-package")
-        if alias_locked_version != "dev-main":
-            raise AssertionError(f"Expected branch-alias lock version to stay dev-main, got {alias_locked_version}")
+            alias_locked_version = load_locked_version(project / "composer.lock", "fixture/aliased-package")
+            if alias_locked_version != "dev-main":
+                raise AssertionError(f"Expected branch-alias lock version to stay dev-main, got {alias_locked_version}")
 
-        targets_file.write_text("fixture/aliased-package\t1.0.x-dev\n", encoding="utf-8")
-        run(
-            [
-                *PHP,
-                composer_repo_url(REPO_ROOT / "scripts" / "validate_locked_targets.php"),
-                composer_repo_url(targets_file),
-                "composer.lock",
-            ],
-            cwd=project,
-        )
+            targets_file.write_text("fixture/aliased-package\t1.0.x-dev\n", encoding="utf-8")
+            run([*PHP, validate_targets_path, composer_repo_url(targets_file), "composer.lock"], cwd=project)
 
-        root_payload = json.loads((project / "composer.json").read_text(encoding="utf-8"))
-        root_payload["require"]["fixture/aliased-package"] = "1.0.x"
-        write_json(project / "composer.json", root_payload)
-        run([*COMPOSER, "update", "--no-install", "--no-scripts"], cwd=project)
+            root_payload = json.loads((project / "composer.json").read_text(encoding="utf-8"))
+            root_payload["require"]["fixture/aliased-package"] = "1.0.x"
+            write_json(project / "composer.json", root_payload)
+            run([*COMPOSER, "update", "--no-install", "--no-scripts"], cwd=project)
 
-        release_locked_version = load_locked_version(project / "composer.lock", "fixture/aliased-package")
-        if release_locked_version != "dev-main":
-            raise AssertionError(
-                f"Expected release-line branch alias to keep dev-main in composer.lock, got {release_locked_version}"
-            )
+            release_locked_version = load_locked_version(project / "composer.lock", "fixture/aliased-package")
+            if release_locked_version != "dev-main":
+                raise AssertionError(
+                    f"Expected release-line branch alias to keep dev-main in composer.lock, got {release_locked_version}"
+                )
 
-        targets_file.write_text("fixture/aliased-package\t1.0.x\n", encoding="utf-8")
-        run(
-            [
-                *PHP,
-                composer_repo_url(REPO_ROOT / "scripts" / "validate_locked_targets.php"),
-                composer_repo_url(targets_file),
-                "composer.lock",
-            ],
-            cwd=project,
-        )
+            targets_file.write_text("fixture/aliased-package\t1.0.x\n", encoding="utf-8")
+            run([*PHP, validate_targets_path, composer_repo_url(targets_file), "composer.lock"], cwd=project)
 
 
 def fallback_fixture() -> None:
@@ -423,26 +430,20 @@ def fallback_fixture() -> None:
                     f"Expected {package_name} to be locked to {expected_version}, got {locked_version}"
                 )
 
-        run(
-            [
-                *PHP,
-                composer_repo_url(REPO_ROOT / "scripts" / "validate_locked_targets.php"),
-                composer_repo_url(targets_file),
-                "composer.lock",
-            ],
-            cwd=project,
-        )
+        with embedded_php_script("validate_locked_targets.php") as validate_targets_path:
+            run([*PHP, validate_targets_path, composer_repo_url(targets_file), "composer.lock"], cwd=project)
 
-        churn_report = run(
-            [
-                *PHP,
-                composer_repo_url(REPO_ROOT / "scripts" / "report_full_rebuild_churn.php"),
-                composer_repo_url(before_full_rebuild),
-                "composer.lock",
-                composer_repo_url(updated_packages_file),
-            ],
-            cwd=project,
-        )
+        with embedded_php_script("report_full_rebuild_churn.php") as report_full_rebuild_churn_path:
+            churn_report = run(
+                [
+                    *PHP,
+                    report_full_rebuild_churn_path,
+                    composer_repo_url(before_full_rebuild),
+                    "composer.lock",
+                    composer_repo_url(updated_packages_file),
+                ],
+                cwd=project,
+            )
 
         report_output = f"{churn_report.stdout}\n{churn_report.stderr}"
         for package_name in ("fixture/package-b", "fixture/package-c", "fixture/package-d"):
@@ -497,16 +498,17 @@ def reference_only_churn_fixture() -> None:
         )
         bumped_packages_file.write_text("fixture/bumped-package\n", encoding="utf-8")
 
-        churn_report = run(
-            [
-                *PHP,
-                composer_repo_url(REPO_ROOT / "scripts" / "report_full_rebuild_churn.php"),
-                composer_repo_url(before_lock),
-                composer_repo_url(after_lock),
-                composer_repo_url(bumped_packages_file),
-            ],
-            cwd=root,
-        )
+        with embedded_php_script("report_full_rebuild_churn.php") as report_full_rebuild_churn_path:
+            churn_report = run(
+                [
+                    *PHP,
+                    report_full_rebuild_churn_path,
+                    composer_repo_url(before_lock),
+                    composer_repo_url(after_lock),
+                    composer_repo_url(bumped_packages_file),
+                ],
+                cwd=root,
+            )
 
         report_output = f"{churn_report.stdout}\n{churn_report.stderr}"
         if "fixture/reference-only-change" not in report_output:
